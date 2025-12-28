@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write, Read};
 use std::path::Path;
 struct DbEngine {
     active_name: Option<String>,
@@ -15,54 +15,89 @@ impl DbEngine {
         }
     }
 
-    fn create_db(&self, name: &str) {
-        let path = format!("{}.db", name);
-        if Path::new(&path).exists() {
-            println!("Error: Database '{}' already exists.", name);
-        } else {
-            File::create(path).expect("Failed to create file");
-            println!("Database '{}' created.", name);
-        }
+   fn create_db(&self, name: &str) {
+    let path = format!("{}.db", name);
+    if Path::new(&path).exists() {
+        println!("Error: Database '{}' already exists.", name);
+    } else {
+        let mut file = File::create(path).expect("Failed to create file");
+        
+        
+        file.write_all(b"RDBX").expect("Header write failed");
+        
+        
+        let version: u32 = 1;
+        file.write_all(&version.to_le_bytes()).expect("Version write failed");
+        
+        println!("Database '{}' created with RDBX v1 header.", name);
     }
+}
 
     fn use_db(&mut self, name: &str) {
-        let path = format!("{}.db", name);
-        if !Path::new(&path).exists() {
-            println!("Error: Database '{}' not found.", name);
-            return;
-        }
+    let path = format!("{}.db", name);
+    if !Path::new(&path).exists() { return; }
+
+    self.index.clear();
+    let mut file = File::open(&path).unwrap();
+    let mut magic = [0u8; 4];
+    let mut version_buf = [0u8; 4];
+    file.read_exact(&mut magic).unwrap();
+    file.read_exact(&mut version_buf).unwrap();
+
+    if &magic != b"RDBX" {
+        println!("Error: Not a valid RustDB file!");
+        return;
+    }
+    
+    let version = u32::from_le_bytes(version_buf);
+    println!("Loading RDBX version {}...", version);
+    
+    
+    loop {
+        let mut k_len_buf = [0u8; 4];
+        let mut v_len_buf = [0u8; 4];
 
         
-        self.index.clear();
-        let file = File::open(&path).unwrap();
-        let reader = BufReader::new(file);
+        if file.read_exact(&mut k_len_buf).is_err() { break; } 
+        file.read_exact(&mut v_len_buf).unwrap();
 
-        for line in reader.lines() {
-            if let Ok(content) = line {
-                let parts: Vec<&str> = content.splitn(2, ',').collect();
-                if parts.len() == 2 {
-                    self.index.insert(parts[0].to_string(), parts[1].to_string());
-                }
-            }
-        }
+        let k_len = u32::from_le_bytes(k_len_buf) as usize;
+        let v_len = u32::from_le_bytes(v_len_buf) as usize;
 
-        self.active_name = Some(name.to_string());
-        println!("Switched to database '{}'.", name);
+        
+        let mut k_buf = vec![0u8; k_len];
+        let mut v_buf = vec![0u8; v_len];
+        file.read_exact(&mut k_buf).unwrap();
+        file.read_exact(&mut v_buf).unwrap();
+
+        let key = String::from_utf8(k_buf).unwrap();
+        let value = String::from_utf8(v_buf).unwrap();
+        
+        self.index.insert(key, value);
     }
+    
+    self.active_name = Some(name.to_string());
+    println!("Switched to database '{}' (Binary Mode).", name);
+}
 
     fn set_fast(&mut self, key: String, value: String) {
     if let Some(ref name) = self.active_name {
-        
         self.index.insert(key.clone(), value.clone());
 
-        
         let mut file = OpenOptions::new()
             .append(true)
             .open(format!("{}.db", name))
             .unwrap();
+
+        let k_len = key.len() as u32;
+        let v_len = value.len() as u32;
+
+        file.write_all(&k_len.to_le_bytes()).unwrap(); 
+        file.write_all(&v_len.to_le_bytes()).unwrap(); 
+        file.write_all(key.as_bytes()).unwrap();       
+        file.write_all(value.as_bytes()).unwrap();     
         
-        writeln!(file, "{},{}", key, value).unwrap();
-        println!("OK (appended)");
+        println!("OK (binary append)");
     }
 }
 
@@ -78,25 +113,36 @@ impl DbEngine {
     }
 
     fn compact(&self) {
-        if let Some(ref name) = self.active_name {
-            let original_path = format!("{}.db", name);
-            let temp_path = format!("{}.temp", name);
+    if let Some(ref name) = self.active_name {
+        let original_path = format!("{}.db", name);
+        let temp_path = format!("{}.temp", name);
 
-            
-            let mut temp_file = File::create(&temp_path).expect("Failed to create temp file");
-            for (key, value) in &self.index {
-                writeln!(temp_file, "{},{}", key, value).expect("Write error");
-            }
+        let mut temp_file = File::create(&temp_path).expect("Failed to create temp file");
+        
+        
+        temp_file.write_all(b"RDBX").unwrap();
+        let version: u32 = 1;
+        temp_file.write_all(&version.to_le_bytes()).unwrap();
 
-            
-            
-            fs::rename(temp_path, original_path).expect("Failed to replace database file");
-            
-            println!("Compaction complete. Storage optimized.");
-        } else {
-            println!("Error: No database selected.");
+        
+        for (key, value) in &self.index {
+            let k_bytes = key.as_bytes();
+            let v_bytes = value.as_bytes();
+            let k_len = k_bytes.len() as u32;
+            let v_len = v_bytes.len() as u32;
+
+            temp_file.write_all(&k_len.to_le_bytes()).unwrap();
+            temp_file.write_all(&v_len.to_le_bytes()).unwrap();
+            temp_file.write_all(k_bytes).unwrap();
+            temp_file.write_all(v_bytes).unwrap();
         }
+
+        fs::rename(temp_path, original_path).expect("Failed to replace database file");
+        println!("Compaction complete (Binary mode). Storage optimized.");
+    } else {
+        println!("Error: No database selected.");
     }
+}
 }
 
 fn main() {
